@@ -109,5 +109,6 @@ connectDB()
   })
   .catch((err) => {
     console.error('❌ Failed to start:', err.message);
-    process.exit(1);
+    // Wait for logs to flush before exiting
+    setTimeout(() => process.exit(1), 1000);
   });
