@@ -1,6 +1,16 @@
 const path = require('path');
 const fs = require('fs');
 
+// Global error handlers - catch everything
+process.on('uncaughtException', (err) => {
+  process.stderr.write(`\n❌ UNCAUGHT EXCEPTION: ${err.message}\n${err.stack}\n`);
+  setTimeout(() => process.exit(1), 2000);
+});
+process.on('unhandledRejection', (err) => {
+  process.stderr.write(`\n❌ UNHANDLED REJECTION: ${err.message || err}\n`);
+  setTimeout(() => process.exit(1), 2000);
+});
+
 // Load .env from server directory (for local dev)
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
@@ -8,7 +18,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const connectDB = require('./config/db');
+const mongoose = require('mongoose');
 const socketHandler = require('./socket/socketHandler');
 
 // Route imports
@@ -17,51 +27,43 @@ const chatRoutes = require('./routes/chatRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 
 // Validate critical env vars
-if (!process.env.MONGO_URI) {
-  console.error('❌ MONGO_URI is not set. Please set it in environment variables or server/.env');
+const MONGO_URI = process.env.MONGO_URI;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!MONGO_URI) {
+  process.stderr.write('❌ MONGO_URI is not set!\n');
   process.exit(1);
 }
-if (!process.env.JWT_SECRET) {
-  console.error('❌ JWT_SECRET is not set. Please set it in environment variables or server/.env');
+if (!JWT_SECRET) {
+  process.stderr.write('❌ JWT_SECRET is not set!\n');
   process.exit(1);
 }
 
-console.log('📋 Environment check passed');
-console.log(`   MONGO_URI: ${process.env.MONGO_URI ? '✅ Set' : '❌ Missing'}`);
-console.log(`   JWT_SECRET: ${process.env.JWT_SECRET ? '✅ Set' : '❌ Missing'}`);
-console.log(`   CLOUDINARY: ${process.env.CLOUDINARY_CLOUD_NAME ? '✅ Set' : '⚠️ Not set (image uploads disabled)'}`);
+// Ensure database name is in the URI
+let mongoUri = MONGO_URI;
+if (mongoUri.includes('mongodb.net/') && mongoUri.includes('mongodb.net/?')) {
+  mongoUri = mongoUri.replace('mongodb.net/?', 'mongodb.net/chatapp?');
+} else if (mongoUri.includes('mongodb.net/') && !mongoUri.split('mongodb.net/')[1].split('?')[0]) {
+  mongoUri = mongoUri.replace('mongodb.net/', 'mongodb.net/chatapp');
+}
+
+process.stdout.write(`📋 Environment: OK\n`);
+process.stdout.write(`🔗 MongoDB URI: ${mongoUri.replace(/\/\/[^:]+:[^@]+@/, '//***:***@')}\n`);
 
 const app = express();
 const server = http.createServer(app);
 
-// CORS config
-const allowedOrigins = [
-  process.env.CLIENT_URL,
-  'http://localhost:5173',
-  'http://localhost:5000',
-].filter(Boolean);
+// CORS
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-// Socket.io setup
+// Socket.io
 const io = new Server(server, {
-  cors: {
-    origin: allowedOrigins,
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
+  cors: { origin: true, methods: ['GET', 'POST'], credentials: true },
   pingTimeout: 60000,
   pingInterval: 25000,
 });
-
-// Middleware
-app.use(cors({
-  origin: function(origin, callback) {
-    if (!origin) return callback(null, true);
-    return callback(null, true);
-  },
-  credentials: true,
-}));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
 
 // API Routes
 app.use('/api/auth', authRoutes);
@@ -70,45 +72,43 @@ app.use('/api/upload', uploadRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString(), uptime: process.uptime() });
+  res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// Serve React frontend in production
+// Serve React frontend
 const clientBuildPath = path.join(__dirname, '..', 'client', 'dist');
 if (fs.existsSync(clientBuildPath)) {
-  console.log(`📂 Serving static files from: ${clientBuildPath}`);
+  process.stdout.write(`📂 Static files: ${clientBuildPath}\n`);
   app.use(express.static(clientBuildPath));
   app.get('*', (req, res) => {
     res.sendFile(path.join(clientBuildPath, 'index.html'));
   });
-} else {
-  console.log('⚠️ No client build found. Run: npm run build --prefix client');
-  app.get('*', (req, res) => {
-    res.status(404).json({ message: 'Client not built. API is running at /api/*' });
-  });
 }
 
-// Global error handler
+// Error handler
 app.use((err, req, res, next) => {
-  console.error('🔥 Server Error:', err.stack);
+  process.stderr.write(`🔥 Error: ${err.stack}\n`);
   res.status(500).json({ message: 'Internal server error' });
 });
 
-// Initialize Socket.io
+// Socket handlers
 socketHandler(io);
 
-// Connect to DB and start server
+// Start
 const PORT = process.env.PORT || 5000;
 
-connectDB()
-  .then(() => {
+process.stdout.write('🔄 Connecting to MongoDB...\n');
+
+mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 15000 })
+  .then((conn) => {
+    process.stdout.write(`✅ MongoDB Connected: ${conn.connection.host}\n`);
     server.listen(PORT, () => {
-      console.log(`\n🚀 Server running on port ${PORT}`);
-      console.log(`📡 Socket.io ready for connections`);
+      process.stdout.write(`🚀 Server running on port ${PORT}\n`);
+      process.stdout.write(`📡 Socket.io ready\n`);
     });
   })
   .catch((err) => {
-    console.error('❌ Failed to start:', err.message);
-    // Wait for logs to flush before exiting
-    setTimeout(() => process.exit(1), 1000);
+    process.stderr.write(`❌ MongoDB Error: ${err.message}\n`);
+    process.stderr.write(`💡 Fix: Go to MongoDB Atlas → Network Access → Add 0.0.0.0/0\n`);
+    setTimeout(() => process.exit(1), 2000);
   });
